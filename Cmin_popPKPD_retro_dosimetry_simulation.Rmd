@@ -1,0 +1,372 @@
+---
+title: "End-to-End popPK/PD + Retro-dosimetry Simulation (Cmin Targeting)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## Overview
+
+This R Markdown runs a **synthetic, end-to-end** workflow:
+
+**Dose → popPK → Cmin → cytokine inhibition → (translational rule) → PTA → dose selection**
+
+Key idea:
+
+1. You define a **biological requirement**: *≥70% cytokine inhibition*.
+2. Use **retro-dosimetry** to convert that requirement into a **Cmin target**.
+3. Use **popPK simulation** to estimate **PTA = P(Cmin ≥ Cmin_target)** for candidate regimens.
+4. Pick the **minimum dose** achieving the program target (e.g., PTA ≥ 0.80).
+
+---
+
+## Packages
+
+```{r packages}
+# install.packages(c("rxode2","dplyr","tibble","purrr","ggplot2"))
+library(rxode2)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+
+set.seed(1)
+```
+
+---
+
+## 0) Synthetic "Truth" Assumptions
+
+```{r assumptions}
+nSub  <- 2000
+tau   <- 24          # dosing interval (h)
+nDose <- 14          # simulate long enough to reach steady state
+dt    <- 0.1         # sampling step for simulation (h)
+
+# popPK typicals (1-comp + first-order absorption)
+theta <- list(
+  CL = 10,   # L/h
+  V  = 50,   # L
+  KA = 1.2   # 1/h
+)
+
+# log-normal IIV (SD on log-scale)
+omega <- list(
+  wCL = 0.30,
+  wV  = 0.25,
+  wKA = 0.35
+)
+
+# PD: cytokine inhibition vs concentration (Imax model)
+pd <- list(
+  Imax = 1.0,
+  IC50 = 1.5,   # mg/L  (synthetic potency)
+  hill = 1.2    # synthetic steepness
+)
+
+# Translational rule mapping (optional):
+# If inhibition >= 70%, then probability of meeting survival criterion is high.
+logit <- function(p) log(p/(1-p))
+a_surv <- logit(0.80)
+b_surv <- 12  # steeper -> sharper "threshold-like" behavior
+```
+
+---
+
+## 1) PK Model (1-compartment, first-order absorption)
+
+```{r pkmodel}
+pk1c_oral <- rxode2({
+  d/dt(depot) = -KA * depot;
+  d/dt(centr) =  KA * depot - (CL/V) * centr;
+  C = centr / V;
+})
+```
+
+---
+
+## 2) Event tables
+
+### QD (q24h)
+
+```{r events_qd}
+make_events <- function(dose_mg){
+  et(time.units = "h", amount.units = "mg") %>%
+    et(amt = dose_mg, cmt = "depot", ii = tau, addl = nDose - 1)
+}
+```
+
+### BID (q12h), with fixed total daily dose
+
+```{r events_bid}
+make_events_bid <- function(total_daily_mg){
+  et(time.units="h", amount.units="mg") %>%
+    et(amt = total_daily_mg/2, cmt = "depot", ii = 12, addl = 2*nDose - 1)
+}
+```
+
+---
+
+## 3) Synthetic population (popPK)
+
+```{r population}
+pop <- tibble(
+  id = 1:nSub,
+  CL = theta$CL * exp(rnorm(nSub, 0, omega$wCL)),
+  V  = theta$V  * exp(rnorm(nSub, 0, omega$wV)),
+  KA = theta$KA * exp(rnorm(nSub, 0, omega$wKA))
+)
+```
+
+---
+
+## 4) Retro-dosimetry: Convert inhibition target → Cmin target
+
+We assume an inhibitory Emax/Imax relationship:
+
+\[
+I(C) = I_{max} \frac{C^\gamma}{IC_{50}^\gamma + C^\gamma}
+\]
+
+Solve for the concentration required to hit **I = 0.70**:
+
+\[
+C_{target} = IC_{50}\left(\frac{0.70}{I_{max}-0.70}\right)^{1/\gamma}
+\]
+
+```{r retro}
+Cmin_target <- pd$IC50 * (0.70/(pd$Imax - 0.70))^(1/pd$hill)
+Cmin_target
+```
+
+---
+
+## 5) Helper: robust subject ID handling for rxSolve output
+
+rxode2 may return subject IDs under different column names depending on version.
+This helper finds it and renames to `id`.
+
+```{r id_helper}
+get_id_col <- function(df){
+  id_col <- intersect(c("id","ID","sim.id","simId","rxSolveId"), names(df))[1]
+  if (is.na(id_col)) {
+    stop("Could not find an ID column in rxSolve output. Columns are: ",
+         paste(names(df), collapse = ", "))
+  }
+  id_col
+}
+```
+
+---
+
+## 6) Core simulation: compute Cmin and inhibition hit (QD)
+
+```{r simulate_qd}
+simulate_one_dose <- function(dose_mg){
+
+  sim <- rxSolve(
+    pk1c_oral,
+    params = pop %>% dplyr::select(id, CL, V, KA),
+    events = make_events(dose_mg),
+    from = 0,
+    to   = tau * nDose,
+    by   = dt,
+    returnType = "data.frame"
+  )
+
+  id_col <- get_id_col(sim)
+
+  sim <- sim %>%
+    dplyr::rename(id = !!rlang::sym(id_col)) %>%
+    dplyr::mutate(time_h = as.numeric(time))   # drop units
+
+  t_start <- tau * (nDose - 1)
+  t_end   <- tau * nDose
+
+  lastInt <- sim %>%
+    dplyr::filter(time_h >= t_start, time_h <= t_end) %>%
+    dplyr::group_by(id) %>%
+    dplyr::summarize(
+      Cmin = min(C),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Inhib  = pd$Imax * (Cmin^pd$hill) / (pd$IC50^pd$hill + Cmin^pd$hill),
+      hit70  = (Inhib >= 0.70),
+      pSurv80 = plogis(a_surv + b_surv * (Inhib - 0.70)),
+      surv80  = rbinom(dplyr::n(), size = 1, prob = pSurv80)
+    )
+
+  tibble::tibble(
+    dose_mg = dose_mg,
+    PTA_inhib70 = mean(lastInt$hit70),
+    PTA_pSurv80_ge_0.80 = mean(lastInt$pSurv80 >= 0.80),
+    Expected_frac_surv80 = mean(lastInt$pSurv80),
+    Realized_frac_surv80 = mean(lastInt$surv80)
+  )
+}
+```
+
+---
+
+## 7) Dose-ranging (QD)
+
+```{r run_qd}
+dose_grid <- c(600, 800, 1000, 1500, 2000, 2500, 3000, 4000)
+results_qd <- purrr::map_dfr(dose_grid, simulate_one_dose)
+results_qd
+```
+
+---
+
+## 8) Core simulation: compute Cmin hit (BID; total daily dose)
+
+```{r simulate_bid}
+simulate_one_daily_bid <- function(total_daily_mg){
+
+  sim <- rxSolve(
+    pk1c_oral,
+    params = pop %>% dplyr::select(id, CL, V, KA),
+    events = make_events_bid(total_daily_mg),
+    from = 0, to = tau*nDose, by = dt,
+    returnType="data.frame"
+  )
+
+  id_col <- get_id_col(sim)
+
+  sim <- sim %>%
+    dplyr::rename(id = !!rlang::sym(id_col)) %>%
+    dplyr::mutate(time_h = as.numeric(time))
+
+  t_start <- tau*(nDose-1); t_end <- tau*nDose
+
+  lastInt <- sim %>%
+    dplyr::filter(time_h >= t_start, time_h <= t_end) %>%
+    dplyr::group_by(id) %>%
+    dplyr::summarize(Cmin = min(C), .groups="drop") %>%
+    dplyr::mutate(
+      Inhib  = pd$Imax * (Cmin^pd$hill) / (pd$IC50^pd$hill + Cmin^pd$hill),
+      hit70  = (Inhib >= 0.70)
+    )
+
+  tibble::tibble(
+    total_daily_mg = total_daily_mg,
+    PTA_inhib70 = mean(lastInt$hit70)
+  )
+}
+```
+
+---
+
+## 9) Dose-ranging (BID) and Cmin distribution check
+
+```{r run_bid}
+dose_grid_daily <- c(1000, 1500, 2000, 2500, 3000, 4000, 6000, 8000)
+bid_res <- purrr::map_dfr(dose_grid_daily, simulate_one_daily_bid)
+bid_res
+```
+
+### Example: Cmin distribution at 6000 mg/day BID
+
+```{r cmin_dist_6000}
+dose_daily <- 6000
+
+sim <- rxSolve(
+  pk1c_oral,
+  params = pop %>% dplyr::select(id, CL, V, KA),
+  events = make_events_bid(dose_daily),
+  from=0, to=tau*nDose, by=dt,
+  returnType="data.frame"
+)
+
+id_col <- get_id_col(sim)
+
+sim <- sim %>%
+  dplyr::rename(id = !!rlang::sym(id_col)) %>%
+  dplyr::mutate(time_h = as.numeric(time))
+
+t_start <- tau*(nDose-1); t_end <- tau*nDose
+
+cmin_tbl <- sim %>%
+  dplyr::filter(time_h >= t_start, time_h <= t_end) %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarize(Cmin = min(C), .groups="drop")
+
+quantile(cmin_tbl$Cmin, c(.1,.2,.5,.8,.9,.95))
+mean(cmin_tbl$Cmin >= Cmin_target)
+Cmin_target
+```
+
+---
+
+## 10) PTA vs dose curve (BID), pick minimal dose meeting target
+
+```{r pta_curve_bid}
+pta_bid <- function(total_daily_mg){
+  sim <- rxSolve(
+    pk1c_oral,
+    params = pop %>% dplyr::select(id, CL, V, KA),
+    events = make_events_bid(total_daily_mg),
+    from=0, to=tau*nDose, by=dt,
+    returnType="data.frame"
+  )
+
+  id_col <- get_id_col(sim)
+
+  sim <- sim %>%
+    dplyr::rename(id = !!rlang::sym(id_col)) %>%
+    dplyr::mutate(time_h = as.numeric(time))
+
+  t_start <- tau*(nDose-1); t_end <- tau*nDose
+
+  cmin_tbl <- sim %>%
+    dplyr::filter(time_h >= t_start, time_h <= t_end) %>%
+    dplyr::group_by(id) %>%
+    dplyr::summarize(Cmin = min(C), .groups="drop")
+
+  mean(cmin_tbl$Cmin >= Cmin_target)
+}
+
+target <- 0.80
+grid <- seq(4000, 8000, by=250)
+pta_tbl <- tibble::tibble(dose = grid, PTA = purrr::map_dbl(grid, pta_bid))
+
+pta_tbl %>% dplyr::filter(PTA >= target) %>% dplyr::slice(1)
+```
+
+---
+
+## 11) Plot: PTA vs Dose (with 0.80 line and chosen dose)
+
+```{r plot_pta, fig.height=4.5, fig.width=7}
+chosen_row <- pta_tbl %>% dplyr::filter(PTA >= target) %>% dplyr::slice(1)
+chosen_dose <- chosen_row$dose
+chosen_pta  <- chosen_row$PTA
+
+ggplot(pta_tbl, aes(x = dose, y = PTA)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_hline(yintercept = target, linetype = "dashed") +
+  geom_vline(xintercept = chosen_dose, linetype = "dotted") +
+  geom_point(aes(x = chosen_dose, y = chosen_pta), size = 4) +
+  annotate(
+    "text",
+    x = chosen_dose,
+    y = chosen_pta,
+    label = paste0("Chosen = ", chosen_dose, " mg/day\nPTA = ", round(chosen_pta, 3)),
+    vjust = -1
+  ) +
+  labs(
+    title = "PTA vs Total Daily Dose (BID)",
+    x = "Total Daily Dose (mg/day, BID regimen)",
+    y = "PTA = P(Cmin ≥ Cmin_target)"
+  ) +
+  ylim(0, 1) +
+  theme_minimal()
+```
