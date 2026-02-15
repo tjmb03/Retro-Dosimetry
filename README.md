@@ -80,6 +80,9 @@ The R Markdown file generates:
 -   PTA vs Dose plots
 -   Automatic selection of minimal dose meeting target
 
+<img width="849" height="544" alt="Screenshot 2026-02-15 at 1 09 18 PM" src="https://github.com/user-attachments/assets/39b3ef8d-92e8-4815-82bd-8d294d6327fb" />
+
+
 ------------------------------------------------------------------------
 
 ## How to Run
