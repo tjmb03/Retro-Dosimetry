@@ -1,7 +1,7 @@
 # Cmin-Based popPK/PD Retro-Dosimetry Simulation
 
 🔗 Live App:
-https://tjmb03.github.io/RetroDosimetry/
+[https://tjmb03.github.io/RetroDosimetry/](https://tjmb03.github.io/Retro-Dosimetry/)
 
 ## Overview
 
