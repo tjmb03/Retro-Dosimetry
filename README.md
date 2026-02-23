@@ -1,7 +1,5 @@
 # Cmin-Based popPK/PD Retro-Dosimetry Simulation
 
-🔗 Live App:
-(https://tjmb03.github.io/Retro-Dosimetry/)
 
 ## Overview
 
@@ -10,6 +8,9 @@ demonstrating:
 
 **Dose → Population PK → Cmin → Cytokine Inhibition → Translational
 Survival Rule → PTA → Dose Selection**
+
+🔗 HTML Overview:
+(https://tjmb03.github.io/Retro-Dosimetry/)
 
 The goal is to illustrate how retro-dosimetry and popPK modeling can be
 integrated to support rational dose selection based on a mechanistic
